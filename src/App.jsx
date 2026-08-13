@@ -1,8 +1,16 @@
 import { useState, useEffect } from "react";
-import { Plus, Trash2, Moon, SunMedium, Search, IndianRupee, ChevronDown, User, Check, FileDown, Home, ListPlus, AlertTriangle } from "lucide-react";
+import { Plus, Trash2, Moon, SunMedium, Search, IndianRupee, ChevronDown, User, Check, FileDown, Home, ListPlus, AlertTriangle, EyeOff, RotateCcw } from "lucide-react";
+
+const API_URL = "https://mart-backend-vse7.onrender.com";
+// Backend layout (Express + Neon Postgres — see server.js):
+//   POST   /api/login                      { name, mobile }
+//   GET    /api/items/:mobile
+//   POST   /api/items/:mobile              { name, category, qty, unit, price }
+//   PATCH  /api/items/:mobile/:id          { qty?, price?, checked?, category?, skipped?, note? }
+//   DELETE /api/items/:mobile/:id
+//   POST   /api/items/:mobile/reset-trip
 
 
-const API_URL = "https://mart-backend-vse7.onrender.com"; 
 const PROFILE_KEY = "dmart_profile_v4";
 const THEME_KEY = "dmart_theme_v4";
 const UNITS = ["kg", "g", "litre", "ml", "packet", "piece", "dozen"];
@@ -112,7 +120,7 @@ class ApiError extends Error {
     this.type = type; // 'auth' | 'server' | 'network' | 'timeout'
   }
 }
-async function apiFetch(url, options = {}, timeoutMs = 10000) {
+async function apiFetch(url, options = {}, timeoutMs = 30000) {
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
     throw new ApiError("You're offline. Check your internet connection.", "network");
   }
@@ -140,12 +148,7 @@ async function apiFetch(url, options = {}, timeoutMs = 10000) {
   }
 }
 
-// const [dark, setDark] = useState(() => {
-//   const saved = localStorage.getItem(THEME_KEY);
-//   return saved ? JSON.parse(saved) : false;
-// });
-
-// ---------- API helpers ----------
+// ---------- API helpers (Express + Neon backend) ----------
 async function apiLogin(name, mobile) {
   return apiFetch(`${API_URL}/api/login`, {
     method: "POST",
@@ -164,11 +167,16 @@ async function apiAddItem(mobile, item) {
   });
 }
 async function apiUpdateItem(mobile, id, patch) {
+  console.log("apiUpdateItem called with:", mobile, id, patch);
+
   return apiFetch(`${API_URL}/api/items/${mobile}/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
   });
+}
+async function apiResetTrip(mobile) {
+  return apiFetch(`${API_URL}/api/items/${mobile}/reset-trip`, { method: "POST" });
 }
 async function apiDeleteItem(mobile, id) {
   return apiFetch(`${API_URL}/api/items/${mobile}/${id}`, { method: "DELETE" });
@@ -201,6 +209,7 @@ export default function DmartApp() {
   const [fCategory, setFCategory] = useState("Kitchen");
   const [categoryTouched, setCategoryTouched] = useState(false);
   const [itemNameError, setItemNameError] = useState("");
+  const [noteDrafts, setNoteDrafts] = useState({}); // id -> in-progress note text, not yet synced
 
   const backendReady = API_URL && API_URL !== "YOUR_BACKEND_URL";
 
@@ -249,7 +258,7 @@ export default function DmartApp() {
 //   localStorage.setItem(THEME_KEY, JSON.stringify(dark));
 // }, [dark]);
 
-  // load items from Neon whenever profile is set
+  // load items from the backend whenever profile is set
   useEffect(() => {
     if (!profile || !backendReady) return;
     loadItems();
@@ -262,7 +271,9 @@ export default function DmartApp() {
     setItemsLoaded(false);
     try {
       const rows = await apiGetItems(profile.mobile);
-      setItems(rows.map((r) => ({ ...r, price: r.price === null ? "" : r.price })));
+      console.log("🔥 LOADED ITEMS:", rows);
+      console.log("🔥 LOADED ITEMS (raw):", JSON.stringify(rows, null, 2));
+      setItems(rows.map((r) => ({ ...r, price: r.price === null ? "" : r.price, skipped: !!r.skipped, note: r.note || "" })));
     } catch (e) {
       setError(e.message || "Could not reach the server.");
       setRetryAction(() => loadItems);
@@ -362,7 +373,8 @@ export default function DmartApp() {
   const searchMatch = debouncedSearch.trim() ? items.find((i) => i.name.toLowerCase() === debouncedSearch.trim().toLowerCase()) : null;
   const categories = [...new Set(items.map((i) => i.category))];
   const boughtItems = items.filter((i) => i.checked);
-  const pendingItems = items.filter((i) => !i.checked);
+  const pendingItems = items.filter((i) => !i.checked && !i.skipped);
+  const skippedItems = items.filter((i) => !i.checked && i.skipped);
   const boughtTotal = boughtItems.reduce((s, i) => s + Number(i.price || 0) * (Number(i.qty) || 1), 0);
   const pendingTotal = pendingItems.reduce((s, i) => s + Number(i.price || 0) * (Number(i.qty) || 1), 0);
 
@@ -430,6 +442,7 @@ export default function DmartApp() {
     setItems((prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i))); // optimistic update
     setError("");
     try {
+      console.log("Calling apiUpdateItem with:", profile.mobile, id, patch);
       await apiUpdateItem(profile.mobile, id, patch);
     } catch (e) {
       setError(e.message || "Could not save that change.");
@@ -468,6 +481,31 @@ export default function DmartApp() {
 
   function toggleCollapse(cat) { setCollapsed((p) => ({ ...p, [cat]: !p[cat] })); }
   function exportPDF() { window.print(); }
+
+  function noteValue(item) { return noteDrafts[item.id] !== undefined ? noteDrafts[item.id] : item.note || ""; }
+  function commitNote(item) {
+    const draft = noteDrafts[item.id];
+    setNoteDrafts((prev) => { const p = { ...prev }; delete p[item.id]; return p; });
+    if (draft === undefined || draft === (item.note || "")) return; // nothing changed, skip a wasted API call
+    updateItem(item.id, { note: draft.trim() });
+  }
+
+  // start a new shopping trip: everything (bought + skipped + notes) becomes pending again
+  async function startNewTrip() {
+    setSyncing(true);
+    setError("");
+    setRetryAction(null);
+    setItems((prev) => prev.map((i) => ({ ...i, checked: false, skipped: false, note: "" ,price: "",qty: 0}))); // optimistic
+    setNoteDrafts({}); // discard any unsaved note text the user was mid-typing
+    try {
+      await apiResetTrip(profile.mobile);
+    } catch (e) {
+      setError(e.message || "Could not start a new trip.");
+      setRetryAction(() => startNewTrip);
+      loadItems();
+    }
+    setSyncing(false);
+  }
 
   const inputStyle = { background: t.surface2, border: `1px solid ${t.border}`, borderRadius: "10px", padding: "9px 12px", color: t.text, fontSize: "14px" };
 
@@ -557,17 +595,21 @@ export default function DmartApp() {
         {tab === "home" && (
           <>
             <div style={{ marginTop: "14px", background: t.surface, border: `1px solid ${t.border}`, borderRadius: "16px", padding: "16px" }}>
-              <div style={{ display: "flex", gap: "18px", fontSize: "13px", flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: "18px", fontSize: "13px", flexWrap: "wrap", alignItems: "center" }}>
                 <div style={{ color: t.accent, display: "flex", alignItems: "center", gap: "4px" }}><IndianRupee size={12} /> {boughtTotal.toFixed(0)} bought ({boughtItems.length})</div>
                 <div style={{ color: t.accent2, display: "flex", alignItems: "center", gap: "4px" }}><IndianRupee size={12} /> {pendingTotal.toFixed(0)} pending ({pendingItems.length})</div>
                 <div style={{ color: t.text, fontWeight: 700, marginLeft: "auto" }}>Total ₹{(boughtTotal + pendingTotal).toFixed(0)}</div>
               </div>
+              <button onClick={startNewTrip} disabled={syncing || !online}
+                style={{ marginTop: "12px", width: "100%", background: "none", border: `1px solid ${t.accent}`, color: t.accent, borderRadius: "10px", padding: "8px", fontWeight: 600, fontSize: "12.5px", cursor: (syncing || !online) ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px", opacity: (syncing || !online) ? 0.6 : 1 }}>
+                <RotateCcw size={13} /> Start new shopping
+              </button>
             </div>
 
             <div style={{ marginTop: "16px" }}>
               {categories.length === 0 && <div style={{ textAlign: "center", color: t.muted, fontSize: "13px", padding: "20px 0" }}>Your list is empty — add items from the "Add" tab first.</div>}
               {categories.map((cat) => {
-                const catItems = filtered.filter((i) => i.category === cat);
+                const catItems = filtered.filter((i) => i.category === cat && !i.skipped);
                 if (catItems.length === 0) return null;
                 const isCollapsed = collapsed[cat];
                 return (
@@ -579,19 +621,46 @@ export default function DmartApp() {
                     {!isCollapsed && (
                       <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "6px" }}>
                         {catItems.map((item) => (
-                          <div key={item.id} style={{ background: t.surface, border: `1px solid ${t.border}`, borderRadius: "12px", padding: "10px 12px", display: "flex", alignItems: "center", gap: "10px", opacity: item.checked ? 0.55 : 1 }}>
-                            <button onClick={() => updateItem(item.id, { checked: !item.checked })}
-                              style={{ width: "22px", height: "22px", minWidth: "22px", borderRadius: "6px", border: `2px solid ${item.checked ? t.accent : t.border}`, background: item.checked ? t.accent : "transparent", cursor: "pointer", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                              {item.checked && <Check size={13} />}
-                            </button>
-                            <span style={{ fontSize: "17px" }}>{getIcon(item.name)}</span>
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                              <div style={{ fontSize: "14px", fontWeight: 600, textDecoration: item.checked ? "line-through" : "none" }}>{item.name}</div>
-                              <div style={{ fontSize: "11.5px", color: t.muted, fontFamily: "monospace" }}>{item.qty} {item.unit}</div>
+                          <div key={item.id} style={{ background: t.surface, border: `1px solid ${t.border}`, borderRadius: "12px", padding: "10px 12px", opacity: item.checked ? 0.55 : 1 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                              <button onClick={() => updateItem(item.id, { checked: !item.checked })}
+                                style={{ width: "22px", height: "22px", minWidth: "22px", borderRadius: "6px", border: `2px solid ${item.checked ? t.accent : t.border}`, background: item.checked ? t.accent : "transparent", cursor: "pointer", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                                {item.checked && <Check size={13} />}
+                              </button>
+                              <span style={{ fontSize: "17px" }}>{getIcon(item.name)}</span>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ fontSize: "14px", fontWeight: 600, textDecoration: item.checked ? "line-through" : "none" }}>{item.name}</div>
+                                <div style={{ fontSize: "11.5px", color: t.muted, fontFamily: "monospace" }}>{item.unit}</div>
+                              </div>
+                              <button
+                                onClick={() => updateItem(item.id, { qty: Math.max(1, Number(item.qty) - 1) })}
+                                disabled={Number(item.qty) <= 1}
+                                style={{ background: t.surface2, border: `1px solid ${t.border}`, borderRadius: "6px",
+                                  width: "24px", height: "24px", cursor: Number(item.qty) <= 1 ? "not-allowed" : "pointer", color: t.text, opacity: Number(item.qty) <= 1 ? 0.5 : 1, fontSize: "13px" }}>−</button>
+                              <span style={{ minWidth: "20px", textAlign: "center", fontSize: "13px", fontWeight: 600 }}>{item.qty}</span>
+                              <button
+                                onClick={() => updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) })}
+                                disabled={Number(item.qty) >= 999}
+                                style={{ background: t.surface2, border: `1px solid ${t.border}`, borderRadius: "6px",
+                                  width: "24px", height: "24px", cursor: Number(item.qty) >= 999 ? "not-allowed" : "pointer", color: t.text, opacity: Number(item.qty) >= 999 ? 0.5 : 1, fontSize: "13px" }}>+</button>
+                              <input type="number" min="0" max="100000" step="0.01" placeholder="₹" value={item.price} onChange={(e) => updateItem(item.id, { price: e.target.value })}
+                                style={{ width: "56px", ...inputStyle, padding: "6px 8px", fontSize: "12.5px" }} />
+                              {!item.checked && (
+                                <button onClick={() => updateItem(item.id, { skipped: true })} title="Not buying this time"
+                                  style={{ background: "none", border: "none", color: t.muted, cursor: "pointer", padding: "2px" }}>
+                                  <EyeOff size={15} />
+                                </button>
+                              )}
                             </div>
-                            <input type="number" min="0" max="100000" step="0.01" placeholder="₹" value={item.price} onChange={(e) => updateItem(item.id, { price: e.target.value })}
-                              style={{ width: "56px", ...inputStyle, padding: "6px 8px", fontSize: "12.5px" }} />
-                            <button onClick={() => deleteItem(item)} style={{ background: "none", border: "none", color: t.danger, cursor: "pointer", padding: "2px" }}><Trash2 size={14} /></button>
+                            <input
+                              value={noteValue(item)}
+                              onChange={(e) => setNoteDrafts((prev) => ({ ...prev, [item.id]: e.target.value }))}
+                              onBlur={() => commitNote(item)}
+                              onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
+                              maxLength={60}
+                              placeholder="Add a note (e.g. only Amul, small pack)"
+                              style={{ width: "100%", marginTop: "6px", marginLeft: "32px", background: "transparent", border: "none", borderBottom: `1px dashed ${t.border}`, color: t.muted, fontSize: "12px", fontStyle: "italic", padding: "3px 2px" }}
+                            />
                           </div>
                         ))}
                       </div>
@@ -599,6 +668,32 @@ export default function DmartApp() {
                   </div>
                 );
               })}
+
+              {skippedItems.length > 0 && (
+                <div style={{ marginTop: "6px" }}>
+                  <div onClick={() => toggleCollapse("__skipped__")} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", padding: "4px 2px" }}>
+                    <span className="display" style={{ fontSize: "15px", color: t.muted }}>Not buying this time ({skippedItems.length})</span>
+                    <ChevronDown size={15} style={{ transform: collapsed["__skipped__"] ? "rotate(-90deg)" : "none", color: t.muted }} />
+                  </div>
+                  {!collapsed["__skipped__"] && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "6px" }}>
+                      {skippedItems.map((item) => (
+                        <div key={item.id} style={{ background: t.surface, border: `1px solid ${t.border}`, borderRadius: "12px", padding: "10px 12px", display: "flex", alignItems: "center", gap: "10px", opacity: 0.6 }}>
+                          <span style={{ fontSize: "17px" }}>{getIcon(item.name)}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: "14px", fontWeight: 600 }}>{item.name}</div>
+                            <div style={{ fontSize: "11.5px", color: t.muted, fontFamily: "monospace" }}>{item.qty} {item.unit}</div>
+                          </div>
+                          <button onClick={() => updateItem(item.id, { skipped: false })}
+                            style={{ background: "none", border: `1px solid ${t.accent}`, color: t.accent, borderRadius: "8px", padding: "5px 10px", fontSize: "11.5px", fontWeight: 600, cursor: "pointer" }}>
+                            Add back
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </>
         )}
@@ -646,7 +741,7 @@ export default function DmartApp() {
 </div>
               {itemNameError && <div style={{ color: t.danger, fontSize: "11.5px", marginTop: "4px" }}>{itemNameError}</div>}
               <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                <input type="number" min="1" max="999" value={fQty} onChange={(e) => setFQty(e.target.value)} onBlur={(e) => setFQty(clampQty(e.target.value))} style={{ ...inputStyle, width: "70px" }} />
+                {/* <input type="number" min="1" max="999" value={fQty} onChange={(e) => setFQty(e.target.value)} onBlur={(e) => setFQty(clampQty(e.target.value))} style={{ ...inputStyle, width: "70px" }} /> */}
                 <select value={fUnit} onChange={(e) => setFUnit(e.target.value)} style={inputStyle}>
                   {UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
                 </select>
@@ -663,20 +758,8 @@ export default function DmartApp() {
                   <span style={{ fontSize: "17px" }}>{getIcon(item.name)}</span>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: "14px", fontWeight: 600 }}>{item.name}</div>
-                    <div style={{ fontSize: "11.5px", color: t.muted, fontFamily: "monospace" }}>{item.category} · {item.qty} {item.unit}</div>
+                    <div style={{ fontSize: "11.5px", color: t.muted, fontFamily: "monospace" }}>{item.category} · {item.unit}</div>
                   </div>
-                  <button
-                    onClick={() => updateItem(item.id, { qty: Math.max(1, Number(item.qty) - 1) })}
-                    disabled={Number(item.qty) <= 1}
-                    style={{ background: t.surface2, border: `1px solid ${t.border}`, borderRadius: "6px",
-                      width: "26px", height: "26px", cursor: Number(item.qty) <= 1 ? "not-allowed" : "pointer", color: t.text, opacity: Number(item.qty) <= 1 ? 0.5 : 1 }}>−</button>
-                  <span style={{ minWidth: "24px", textAlign: "center", fontSize: "14px", fontWeight: 600 }}>
-                    {item.qty}
-                  </span>
-                  <button
-                    onClick={() => updateItem(item.id, { qty: Math.min(999, Number(item.qty) + 1) })}
-                    disabled={Number(item.qty) >= 999}
-                    style={{ background: t.surface2, border: `1px solid ${t.border}`, borderRadius: "6px", width: "26px", height: "26px", cursor: Number(item.qty) >= 999 ? "not-allowed" : "pointer", color: t.text, opacity: Number(item.qty) >= 999 ? 0.5 : 1 }}>+</button>
                   <button onClick={() => deleteItem(item)} style={{ background: "none", border: "none", color: t.danger, cursor: "pointer", padding: "4px" }}><Trash2 size={15} /></button>
                 </div>
               ))}
