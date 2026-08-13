@@ -191,7 +191,7 @@ export default function DmartApp() {
   const [items, setItems] = useState([]);
   const [itemsLoaded, setItemsLoaded] = useState(false);
   const [dark, setDark] = useState(true);
-  const [tab, setTab] = useState("add");
+  const [tab, setTab] = useState("home");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [collapsed, setCollapsed] = useState({});
@@ -202,6 +202,7 @@ export default function DmartApp() {
   const [pendingDelete, setPendingDelete] = useState(null); // { item, timer }
   const [mobileError, setMobileError] = useState("");
   const [nameError, setNameError] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
 
   const [fName, setFName] = useState("");
   const [fQty, setFQty] = useState(1);
@@ -265,18 +266,19 @@ export default function DmartApp() {
     // eslint-disable-next-line
   }, [profile]);
 
-  async function loadItems() {
+  // silent=true is used for background refreshes (after add/update/delete) so we
+  // DON'T flip itemsLoaded back to false and unmount the whole page into <Loader/>.
+  // That flicker was what looked like a "page reload" on every save.
+  async function loadItems(silent = false) {
     setError("");
     setRetryAction(null);
-    setItemsLoaded(false);
+    if (!silent) setItemsLoaded(false);
     try {
       const rows = await apiGetItems(profile.mobile);
-      console.log("🔥 LOADED ITEMS:", rows);
-      console.log("🔥 LOADED ITEMS (raw):", JSON.stringify(rows, null, 2));
       setItems(rows.map((r) => ({ ...r, price: r.price === null ? "" : r.price, skipped: !!r.skipped, note: r.note || "" })));
     } catch (e) {
       setError(e.message || "Could not reach the server.");
-      setRetryAction(() => loadItems);
+      setRetryAction(() => () => loadItems(silent));
     }
     setItemsLoaded(true);
   }
@@ -299,14 +301,17 @@ export default function DmartApp() {
 
     setError("");
     setRetryAction(null);
+    setLoggingIn(true);
     try {
       await apiLogin(p.name, p.mobile);
       setProfile(p);
+      setTab("home"); // land on Home/Buy right after login
       window.storage.set(PROFILE_KEY, JSON.stringify(p), false).catch(() => {});
     } catch (e) {
       setError(e.message || "Could not log in.");
       setRetryAction(() => () => saveProfile(p));
     }
+    setLoggingIn(false);
   }
 
   const t = dark
@@ -335,6 +340,7 @@ export default function DmartApp() {
           @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&family=Inter:wght@400;500;600;700&display=swap');
           * { box-sizing: border-box; }
           html, body, #root { margin: 0; padding: 0; width: 100%; min-height: 100%; background: ${t.bg}; }
+          @keyframes spin { to { transform: rotate(360deg); } }
         `}</style>
         <div style={{ background: t.surface, border: `1px solid ${t.border}`, borderRadius: "18px", padding: "28px", width: "100%", maxWidth: "360px", color: t.text, boxSizing: "border-box" }}>
           <div style={{ fontFamily: "'Baloo 2', cursive", fontSize: "24px", marginBottom: "6px" }}>🛒 D-Mart List</div>
@@ -359,10 +365,27 @@ export default function DmartApp() {
             maxLength={10} style={{ width: "100%", padding: "10px 12px", borderRadius: "10px", border: `1px solid ${mobileError ? t.danger : t.border}`, background: t.surface2, color: t.text, marginBottom: mobileError ? "4px" : "16px", fontSize: "14px" }} />
           {mobileError && <p style={{ color: t.danger, fontSize: "11.5px", margin: "0 0 16px" }}>{mobileError}</p>}
           <button
-            disabled={!nameInput.trim() || mobileInput.length < 10 || !online}
+            disabled={!nameInput.trim() || mobileInput.length < 10 || !online || loggingIn}
             onClick={() => saveProfile({ name: nameInput.trim(), mobile: mobileInput })}
-            style={{ width: "100%", padding: "11px", borderRadius: "10px", border: "none", background: (!nameInput.trim() || mobileInput.length < 10 || !online) ? t.muted : t.accent, color: "#fff", fontWeight: 600, fontSize: "14px", cursor: "pointer" }}
-          >Get started</button>
+            style={{
+              width: "100%", padding: "11px", borderRadius: "10px", border: "none",
+              background: (!nameInput.trim() || mobileInput.length < 10 || !online || loggingIn) ? t.muted : t.accent,
+              color: "#fff", fontWeight: 600, fontSize: "14px",
+              cursor: (!nameInput.trim() || mobileInput.length < 10 || !online || loggingIn) ? "not-allowed" : "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center", gap: "8px",
+            }}
+          >
+            {loggingIn && (
+              <span
+                style={{
+                  width: "14px", height: "14px", borderRadius: "50%",
+                  border: "2px solid rgba(255,255,255,0.4)", borderTopColor: "#fff",
+                  display: "inline-block", animation: "spin 0.7s linear infinite",
+                }}
+              />
+            )}
+            {loggingIn ? "Logging in…" : "Get started"}
+          </button>
         </div>
       </div>
     );
@@ -428,7 +451,7 @@ export default function DmartApp() {
         break; // stop the batch on first network failure, keep the rest of fName intact
       }
     }
-    await loadItems();
+    await loadItems(true);
     if (!failed) {
       setFName(""); setFQty(1); setCategoryTouched(false);
     }
@@ -447,7 +470,7 @@ export default function DmartApp() {
     } catch (e) {
       setError(e.message || "Could not save that change.");
       setRetryAction(() => () => updateItem(id, patch));
-      loadItems(); // resync with server truth
+      loadItems(true); // resync with server truth
     }
   }
 
@@ -466,7 +489,7 @@ export default function DmartApp() {
       } catch (e) {
         setError(e.message || "Could not delete item.");
         setRetryAction(() => () => deleteItem(item));
-        loadItems();
+        loadItems(true);
       }
     }, 5000);
     setPendingDelete({ item, timer });
@@ -502,7 +525,7 @@ export default function DmartApp() {
     } catch (e) {
       setError(e.message || "Could not start a new trip.");
       setRetryAction(() => startNewTrip);
-      loadItems();
+      loadItems(true);
     }
     setSyncing(false);
   }
@@ -844,5 +867,17 @@ function PrintTable({ rows }) {
 }
 
 function Loader({ t }) {
-  return <div style={{ background: t.bg, minHeight: "300px", display: "flex", alignItems: "center", justifyContent: "center", color: t.muted, fontFamily: "sans-serif" }}>Loading...</div>;
+  return (
+    <div style={{ background: t.bg, minHeight: "300px", width: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "10px", color: t.muted, fontFamily: "sans-serif" }}>
+      <style>{`@keyframes dmart-spin { to { transform: rotate(360deg); } }`}</style>
+      <span
+        style={{
+          width: "28px", height: "28px", borderRadius: "50%",
+          border: `3px solid ${t.muted}33`, borderTopColor: t.accent || t.muted,
+          display: "inline-block", animation: "dmart-spin 0.8s linear infinite",
+        }}
+      />
+      <span style={{ fontSize: "13px" }}>Loading...</span>
+    </div>
+  );
 }
